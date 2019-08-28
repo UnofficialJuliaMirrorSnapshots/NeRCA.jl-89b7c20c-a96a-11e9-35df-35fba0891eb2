@@ -6,6 +6,7 @@ using Sockets
 using DataStructures
 using StaticArrays
 using HDF5
+using PGFPlotsX
 using RecipesBase
 using PlotThemes
 using JuMP
@@ -27,6 +28,7 @@ export
     mc_run_id,
     svdfit, matrix, rows,
     CHClient, CHTag, CHPrefix, CHMessage, subscribe,
+    ztplot,
     savefigs,
     @ip_str
 
