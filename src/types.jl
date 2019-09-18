@@ -5,6 +5,12 @@ const Floor = UInt8
 const DU = UInt8
 const HitTime = Float64
 
+
+struct OMKey
+    dom_id::UInt32
+    channel_id::UInt8
+end
+
 struct Position{T} <: FieldVector{3, T}
     x::T
     y::T
@@ -85,6 +91,10 @@ end
 struct JMuon
     JENERGY_CHI2::Float64
     JENERGY_ENERGY::Float64
+    JENERGY_MUON_RANGE_METRES::Float64
+    JENERGY_NDF::Float64
+    JENERGY_NOISE_LIKELIHOOD::Float64
+    JENERGY_NUMBER_OF_HITS::Float64
     JGANDALF_BETA0_RAD::Float64
     JGANDALF_BETA1_RAD::Float64
     JGANDALF_CHI2::Float64
@@ -99,6 +109,8 @@ struct JMuon
     JSTART_LENGTH_METRES::Float64
     JSTART_NPE_MIP::Float64
     JSTART_NPE_MIP_TOTAL::Float64
+    JVETO_NPE::Float64
+    JVETO_NUMBER_OF_HITS::Float64
     dir_x::Float64
     dir_y::Float64
     dir_z::Float64
@@ -194,6 +206,7 @@ struct Calibration
     t0::Dict{Int32,Vector{Float64}}
     du::Dict{Int32,DU}
     floor::Dict{Int32,Floor}
+    omkeys::Dict{Int32,OMKey}
     max_z
     n_dus
 end
