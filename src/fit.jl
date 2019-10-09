@@ -1,4 +1,4 @@
-struct SingleDUParams
+mutable struct SingleDUParams
     d::Float64
     t::Float64
     z::Float64
@@ -187,16 +187,26 @@ function create_hit_pool(hits::T) where T<:Vector{NeRCA.CalibratedHit}
     hit_pool
 end
 
+"""
+    function select_hits(du_hits, hit_pool; Δt₋=10, Δz=9, new_hits=nothing)
 
-function select_hits(hits, hit_pool; Δt=10, Δz=9, new_hits=nothing)
+Returns the seed hits suited for a Cherenkov hit time residual based
+reconstruction algorithm.
+
+The `du_hits` should only contain hits for a single DU. The hit_pool holds
+all other hit candidates (e.g. created by `create_hit_pool()`). `Δt₋` is
+the allowed negative time error for the arrival time, `Δz` distance
+between two floors.
+"""
+function select_hits(du_hits, hit_pool; Δt₋=10, Δz=9, new_hits=nothing)
     intervals = Dict{Int16, Interval{Float64}}()
-    hits₀ = NeRCA.create_hit_pool(hits)
+    hits₀ = NeRCA.create_hit_pool(du_hits)
     
     extended = Vector{CalibratedHit}()
     
     function time_interval(t₀, tₜ, Δfloor)
-        t₋ = tₜ - Δfloor*Δt
-        t₊ = max(t₀ + Δfloor*Δz*NeRCA.N_SEAWATER/NeRCA.c_0*1e9 + Δt, tₜ + Δfloor*Δt)
+        t₋ = tₜ - Δfloor*Δt₋
+        t₊ = max(t₀ + Δfloor*Δz*NeRCA.N_SEAWATER/NeRCA.c_0*1e9 + Δt₋, tₜ + Δfloor*Δt₋)
         @interval(t₋, t₊)
     end
     
@@ -225,7 +235,7 @@ function select_hits(hits, hit_pool; Δt=10, Δz=9, new_hits=nothing)
         end
     end
     
-    hit_seeds = new_hits == nothing ? hits : new_hits
+    hit_seeds = new_hits == nothing ? du_hits : new_hits
     
     for hit in hit_seeds
         t₀ = hit.t
@@ -269,53 +279,44 @@ function select_hits(hits, hit_pool; Δt=10, Δz=9, new_hits=nothing)
     end
     
     if length(extended) == 0
-        return hits
+        return du_hits
     end
-    extension = unique(h->h.floor, sort(vcat(hits, extended), by=h->h.t))
-    return select_hits(extension, hit_pool; Δt=Δt, Δz=Δz, new_hits=extended)
+    extension = unique(h->h.floor, sort(vcat(du_hits, extended), by=h->h.t))
+    return select_hits(extension, hit_pool; Δt₋=Δt₋, Δz=Δz, new_hits=extended)
 end
 
 
 struct SingleDUMinimiser <: Function
-    hit_positions::Vector{Position}
     z_positions::Vector{Float64}
     times::Vector{Float64}
     pmt_directions::Vector{Direction}
+    tots::Vector{Int16}
     multiplicities::Vector{Int}
     max_multiplicity::Float64
     nphes::Vector{Float64}
     average_coinc_tots::Vector{Float64}
-    x::Float64
-    y::Float64
 end
 
 function SingleDUMinimiser(hits::Vector{CalibratedHit}, triggered_hits::Vector{CalibratedHit})
     n = length(hits)
     n_triggered = length(triggered_hits)
-    hit_positions = Vector{Position}()
-    x_positions = Vector{Float64}()
-    y_positions = Vector{Float64}()
     z_positions = Vector{Float64}()
     times = Vector{Float64}()
     multiplicities = Vector{Int32}()
     pmt_directions = Vector{Direction}()
+    tots = Vector{Int16}()
     sizehint!(z_positions, n)
     sizehint!(times, n)
     sizehint!(multiplicities, n)
     sizehint!(pmt_directions, n_triggered)
     @inbounds for i ∈ 1:n
         hit = hits[i]
-        push!(hit_positions, hit.pos)
-        push!(x_positions, hit.pos.x)
-        push!(y_positions, hit.pos.y)
         push!(z_positions, hit.pos.z)
+        push!(tots, hit.tot)
         push!(times, hit.t)
         push!(multiplicities, hit.multiplicity.count)
         push!(pmt_directions, hit.dir)
     end
-    # for i ∈ 1:n_triggered
-    #     push!(pmt_directions, triggered_hits[i].dir)
-    # end
     max_multiplicity = maximum(multiplicities)
     nphe = Vector{Float32}()
     average_coinc_tots = Vector{Float32}()
@@ -326,7 +327,7 @@ function SingleDUMinimiser(hits::Vector{CalibratedHit}, triggered_hits::Vector{C
         estimated_nphes = sum([nphes(h.tot) for h in coinc_hits])
         push!(nphe, estimated_nphes)
     end
-    SingleDUMinimiser(hit_positions, z_positions, times, pmt_directions, multiplicities, max_multiplicity, nphe, average_coinc_tots, mean(x_positions), mean(y_positions))
+    SingleDUMinimiser(z_positions, times, pmt_directions, tots, multiplicities, max_multiplicity, nphe, average_coinc_tots)
 end
 
 
@@ -336,23 +337,17 @@ end
 The quality function to be minimised when performing the single DU fit.
 `d_closest` is the closest distance between the track (starting at `t₀` and
 the DU at time `t_closest` with the z-coordinate `z_closest`. The direction
-vector is `(0, 0, dir_z)` and `ϕ` the azimuth angle.
+is `dir_z` and `ϕ` (azimuth).
 
 """
 function (s::SingleDUMinimiser)(d_closest, t_closest, z_closest, dir_z, ϕ, t₀)
     n = length(s.times)
 
     d_γ, ccalc = make_cherenkov_calculator(d_closest, t_closest, z_closest, dir_z, t₀)
-    expected_times = ccalc.(s.z_positions)
-    # _pos = cartesian(ϕ, π/2; r=d_closest)  # position of the track relative to (0,0,0)
-    # track_pos = Position(_pos.x + s.x, _pos.y + s.y, z_closest)
-    #
-    # track_dir = cartesian(ϕ, acos(dir_z))
-    # track = Track(track_dir, track_pos, t₀)
 
     Q = 0.0
     @inbounds for i ∈ 1:n
-        t = s.times[i]
+        t = s.times[i] - slew(s.tots[i])
         z = s.z_positions[i]
         m = s.multiplicities[i]
         t_exp = ccalc(z)
@@ -360,26 +355,13 @@ function (s::SingleDUMinimiser)(d_closest, t_closest, z_closest, dir_z, ϕ, t₀
         zenith_acceptance = 1 - NeRCA.zenith(Direction(0,0,1))/π
         photon_distance = d_γ(z)
 
-        # pos_cherenkov = cherenkov_origin(s.hit_positions[i], track)
-        # photon_dir = s.hit_positions[i] - pos_cherenkov
-        # ξ = angle_between(s.pmt_directions[i], -photon_dir)
-
         pmtᵩ = azimuth(-s.pmt_directions[i])
-        # Δϕ = abs(pmtᵩ - ϕ) #% 2π
-        # Δϕ = abs(pmtᵩ - ϕ)
-        ξ = (ϕ - pmtᵩ - deg2rad(42))^2
-        # Δz = z - z_closest 
-        # if dir_z < 0  # downgoing
-        #     
-        # else
-        # end
-
+        ξ = (ϕ - pmtᵩ)^2
         
-        Q += Δt^2 + photon_distance * s.nphes[i] / 72.0 / 10 * zenith_acceptance + ξ * 10 #+ ξ * 10
+        Q += Δt^2 + photon_distance * s.nphes[i] / 72.0 * zenith_acceptance + ξ
     end
 
-    Δts = abs.(s.times - expected_times)
-    return Q
+    Q
 end
 
 struct MultiDUMinimiser <: Function
@@ -440,12 +422,35 @@ end
 
 @with_kw struct SingleDURecoParams
     floor_distance::Int = 9
-    Δt_extra::Int = 10
+    Δt₋::Int = 10
+    multiplicity::Int = 3
+    min_hits::Int = 3
+    Δt::Float64 = 10
     data_type::AbstractString = "mupage"
-    discard_worst_hit::Bool = false
 end
 
 DrWatson.default_prefix(s::SingleDURecoParams) = "SingleDUReco"
+
+
+function startparams(SingleDUParams, du_hits::Vector{NeRCA.CalibratedHit})
+    brightest_floor = NeRCA.most_frequent(h -> h.floor, du_hits)
+
+    hits_on_brightest_floor = filter(h -> h.floor == brightest_floor, du_hits)
+    thits_on_brightest_floor = filter(h -> h.triggered, hits_on_brightest_floor)
+
+    if length(thits_on_brightest_floor) == 0
+        z_closest = hits_on_brightest_floor[1].pos.z
+        hit_time = mean([h.t for h in hits_on_brightest_floor])
+    else
+        closest_hit = thits_on_brightest_floor[1]
+        z_closest = closest_hit.pos.z
+        hit_time = closest_hit.t
+    end
+
+    # ϕ = azimuth(sum([-h.dir for h in du_hits]) ./ length(du_hits))
+
+    SingleDUParams(10.0, hit_time, z_closest, -0.9, π, hit_time)
+end
 
 
 function single_du_fit(du_hits::Vector{NeRCA.CalibratedHit}, par::SingleDURecoParams; print_level=0)
@@ -455,11 +460,11 @@ function single_du_fit(du_hits::Vector{NeRCA.CalibratedHit}, par::SingleDURecoPa
 
     hit_pool = create_hit_pool(du_hits)
 
-    hits₀ = unique(h->h.floor, nfoldhits(du_hits, 10, 2))
-    if length(hits₀) < 3
+    hits₀ = unique(h->h.floor, nfoldhits(du_hits, par.Δt, par.multiplicity))
+    if length(hits₀) < par.min_hits
         hits₀ = unique(h->h.floor, triggered(du_hits))
     end
-    shits = select_hits(hits₀, hit_pool; Δt = par.Δt_extra, Δz = par.floor_distance)
+    shits = select_hits(hits₀, hit_pool; Δt₋ = par.Δt₋, Δz = par.floor_distance)
 
     qfunc = SingleDUMinimiser(shits, filter(h->h.triggered, du_hits))
 
@@ -467,65 +472,58 @@ function single_du_fit(du_hits::Vector{NeRCA.CalibratedHit}, par::SingleDURecoPa
 
     register(model, :qfunc, 6, qfunc, autodiff=true)
 
-    brightest_floor = NeRCA.most_frequent(h -> h.floor, du_hits)
+    max_z = maximum([h.pos.z for h in shits]) + 20
+    min_z = minimum([h.pos.z for h in shits]) - 20
 
-    hits_on_brightest_floor = filter(h -> h.floor == brightest_floor, du_hits)
-    thits_on_brightest_floor = filter(h -> h.triggered, hits_on_brightest_floor)
+    sdp₀ = startparams(SingleDUParams, du_hits)
 
-    if length(thits_on_brightest_floor) == 0
-        z_closest_start = hits_on_brightest_floor[1].pos.z
-        hit_time = mean([h.t for h in hits_on_brightest_floor])
-    else
-        closest_hit = thits_on_brightest_floor[1]
-        z_closest_start = closest_hit.pos.z
-        hit_time = closest_hit.t
-    end
+    @variable(model, 1 <= d_closest <= 100, start=sdp₀.d)
+    @variable(model, sdp₀.t - 1000 <= t_closest <= sdp₀.t + 1000, start=sdp₀.t)
+    @variable(model, min_z <= z_closest <= max_z, start=sdp₀.z)
+    @variable(model, -0.999 <= dir_z <= .999, start=sdp₀.dz)
+    @variable(model, -4π <= ϕ₀ <= 4π, start=sdp₀.ϕ)
+    @variable(model, t₀, start=sdp₀.t₀)
 
-    d_closest_start = 10.0
-    t_closest_start = hit_time
-    dir_z_start = -0.9
-    ϕ_start = π
-    t₀_start = hit_time
-
-    max_z = maximum([h.pos.z for h in shits]) - 2*13
-    min_z = minimum([h.pos.z for h in shits]) + 2*13
-    if min_z > max_z
-        min_z = abs(max_z - min_z) / 2
-    end
-
-    @variable(model, 1 <= d_closest <= 100, start=d_closest_start)
-    @variable(model, hit_time - 1000 <= t_closest <= hit_time + 1000, start=t_closest_start)
-    @variable(model, min_z <= z_closest <= max_z, start=z_closest_start)
-    @variable(model, -0.999 <= dir_z <= .999, start=dir_z_start)
-    @variable(model, -2π <= ϕ <= 4π, start=ϕ_start)
-    @variable(model, t₀, start=t₀_start)
-
-    @NLobjective(model, Min, qfunc(d_closest, t_closest, z_closest, dir_z, ϕ, t₀))
+    @NLobjective(model, Min, qfunc(d_closest, t_closest, z_closest, dir_z, ϕ₀, t₀))
 
     optimize!(model);
-    values = map(value, [d_closest, t_closest, z_closest, dir_z, ϕ, t₀])
-    Q₀ = qfunc(values...)/length(shits)
+    values = map(value, [d_closest, t_closest, z_closest, dir_z, ϕ₀, t₀])
+    sdp = SingleDUParams(values...)
+    ϕ = estimate_azimuth(sdp, shits, create_hit_pool(du_hits))
+    sdp.ϕ = ϕ
 
-    d_γ, ccalc = make_cherenkov_calculator(map(value, [d_closest, t_closest, z_closest, dir_z, t₀])...) 
-    if par.discard_worst_hit && length(shits) > 3
-        Δts = [abs(ccalc(h.pos.z) - h.t) for h in shits]
-        idx = argmax(Δts)
-        deleteat!(Δts, idx)
-        deleteat!(shits, idx)
+    return ROyFit(sdp, sdp₀, qfunc(values...)/length(shits), shits, model)
+end
 
-        qfunc = SingleDUMinimiser(shits, filter(h->h.triggered, du_hits))
-        qfunc_sym = gensym()
-        values_try = map(value, [d_closest, t_closest, z_closest, dir_z, ϕ, t₀])
-        register(model, qfunc_sym, 6, qfunc, autodiff=true)
-        set_NL_objective(model, MOI.MIN_SENSE, :($qfunc_sym($(d_closest), $(t_closest), $(z_closest), $(dir_z), $(ϕ), $(t₀))))
-        optimize!(model)
 
-        Q₀ = qfunc(values...)/length(shits)
+function estimate_azimuth(
+    sdp::SingleDUParams,
+    direct_hits::Vector{CalibratedHit},
+    hit_pool::Dict{Int, Vector{CalibratedHit}};
+    Δt=20, n=N_SEAWATER
+)
+    ϕ = azimuth(sum([-h.dir for h in direct_hits]) ./ length(direct_hits))
+
+    dᵧ, ccalc = make_cherenkov_calculator(sdp)
+
+    late_hits = Vector{CalibratedHit}()
+    for (floor, hits) in hit_pool
+        t₀ = ccalc(first(hits).pos.z)
+        for hit in hits
+            if hit.t - t₀ > Δt
+                push!(late_hits, hit)
+            end
+        end
     end
 
-    values = map(value, [d_closest, t_closest, z_closest, dir_z, ϕ, t₀])
-    sdp = SingleDUParams(values...)
-    sdp_initial = SingleDUParams(d_closest_start, t_closest_start, z_closest_start, dir_z_start, ϕ_start, t₀_start)
+    if length(late_hits) == 0
+        return ϕ
+    end
 
-    return ROyFit(sdp, sdp_initial, qfunc(values...)/length(shits), shits, model)
+    ϕₗ = azimuth(sum([-h.dir for h in late_hits]) ./ length(late_hits))
+    if ϕ - ϕₗ < 0
+        return ϕ - cos(1/n)
+    else
+        return ϕ + cos(1/n)
+    end
 end
